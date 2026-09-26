@@ -1,0 +1,79 @@
+# Dockerfile per a Railway. NO va amunt amb la pull request del català.
+#
+# És el Dockerfile oficial del Fider amb tres coses tretes, i només tres:
+#
+# 1. La directiva `# syntax=docker/dockerfile:1`.
+# 2. Els `--platform=${TARGETPLATFORM:-linux/amd64}` dels `FROM`. Docker mateix
+#    ja avisa que són redundants, i la variable només l'omple buildx.
+# 3. Els `--mount=type=cache` dels `RUN`. Aquests són el motiu de debò: són
+#    l'única cosa del fitxer que EXIGEIX BuildKit, i el constructor de Railway
+#    rebutja el fitxer per això («The Dockerfile failed validation»).
+#    Comprovat: amb `DOCKER_BUILDKIT=0` la construcció s'atura al pas 6 dient
+#    «the --mount option requires BuildKit».
+#
+# Sense les caus la construcció és més lenta (es torna a baixar `go mod` i
+# `npm ci` cada vegada) i produeix la MATEIXA imatge. És un preu de temps de
+# construcció, no de resultat.
+
+
+#####################
+### Server Build Step
+#####################
+FROM golang:1.25-bookworm AS server-builder
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    gcc \
+    libc6-dev
+
+RUN mkdir /server
+WORKDIR /server
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . ./
+
+ARG COMMITHASH
+ARG VERSION
+RUN COMMITHASH=${COMMITHASH} VERSION=${VERSION} GOOS=${TARGETOS} GOARCH=${TARGETARCH} make build-server
+#################
+### UI Build Step
+#################
+FROM node:22-bookworm AS ui-builder 
+
+WORKDIR /ui
+
+COPY package.json package-lock.json ./
+RUN npm ci --maxsockets 1
+
+COPY . .
+RUN make build-ssr
+RUN make build-ui
+
+################
+### Runtime Step
+################
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y ca-certificates
+
+WORKDIR /app
+
+COPY --from=server-builder /server/migrations /app/migrations
+COPY --from=server-builder /server/views /app/views
+COPY --from=server-builder /server/locale /app/locale
+COPY --from=server-builder /server/LICENSE /app
+COPY --from=server-builder /server/fider /app
+COPY --from=server-builder /server/static /app/static
+
+COPY --from=ui-builder /ui/favicon.png /app
+COPY --from=ui-builder /ui/dist /app/dist
+COPY --from=ui-builder /ui/robots.txt /app
+COPY --from=ui-builder /ui/ssr.js /app
+
+EXPOSE 3000
+
+HEALTHCHECK --timeout=5s CMD ./fider ping
+
+CMD ./fider migrate && ./fider
